@@ -1,0 +1,16 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+dist/
+*.tgz
+node_modules/
+
+# IDE/Editor
+.idea/
+.DS_Store
+
+# Local benchmarking workspace
+benchmark/
+
+# Local review notes
+review.md

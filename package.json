@@ -1,0 +1,41 @@
+{
+  "name": "@zenith139/codex-oauth",
+  "version": "0.0.1",
+  "description": "CLI for switching Codex accounts",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zenith139/codex-oauth"
+  },
+  "homepage": "https://github.com/zenith139/codex-oauth",
+  "bugs": {
+    "url": "https://github.com/zenith139/codex-oauth/issues"
+  },
+  "bin": {
+    "codex-oauth": "bin/codex-oauth.js"
+  },
+  "files": [
+    "bin/",
+    "runtime/",
+    "LICENSE",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@zenith139/codex-oauth-linux-x64": "0.0.1",
+    "@zenith139/codex-oauth-linux-arm64": "0.0.1",
+    "@zenith139/codex-oauth-darwin-x64": "0.0.1",
+    "@zenith139/codex-oauth-darwin-arm64": "0.0.1",
+    "@zenith139/codex-oauth-win32-x64": "0.0.1",
+    "@zenith139/codex-oauth-win32-arm64": "0.0.1"
+  },
+  "scripts": {
+    "check:versions": "node scripts/npm/check-versions.mjs",
+    "stage:npm": "node scripts/npm/stage-packages.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

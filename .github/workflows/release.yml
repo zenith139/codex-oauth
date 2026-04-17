@@ -1,0 +1,351 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Zig test
+        run: |
+          zig version
+          zig test src/main.zig -lc
+
+      - name: Build native binary
+        run: zig build -Doptimize=ReleaseSafe
+
+  release-assets:
+    name: Build Release Assets (${{ matrix.id }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: linux-x64
+            zig_target: x86_64-linux-gnu
+            binary_name: codex-oauth
+            archive_name: codex-oauth-Linux-X64.tar.gz
+          - id: linux-arm64
+            zig_target: aarch64-linux-gnu
+            binary_name: codex-oauth
+            archive_name: codex-oauth-Linux-ARM64.tar.gz
+          - id: darwin-x64
+            zig_target: x86_64-macos-none
+            binary_name: codex-oauth
+            archive_name: codex-oauth-macOS-X64.tar.gz
+          - id: darwin-arm64
+            zig_target: aarch64-macos-none
+            binary_name: codex-oauth
+            archive_name: codex-oauth-macOS-ARM64.tar.gz
+          - id: win32-x64
+            zig_target: x86_64-windows-gnu
+            binary_name: codex-oauth.exe
+            archive_name: codex-oauth-Windows-X64.zip
+          - id: win32-arm64
+            zig_target: aarch64-windows-gnu
+            binary_name: codex-oauth.exe
+            archive_name: codex-oauth-Windows-ARM64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.1
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Check versions
+        run: node scripts/npm/check-versions.mjs ${{ github.ref_name }}
+
+      - name: Build binary
+        run: zig build -Dtarget=${{ matrix.zig_target }} -Doptimize=ReleaseSafe
+
+      - name: Stage artifact bundle
+        shell: bash
+        run: |
+          mkdir -p "artifacts/${{ matrix.id }}/binary"
+          cp "zig-out/bin/${{ matrix.binary_name }}" "artifacts/${{ matrix.id }}/binary/${{ matrix.binary_name }}"
+          if [[ "${{ matrix.id }}" == win32-* ]]; then
+            cp "zig-out/bin/codex-oauth-auto.exe" "artifacts/${{ matrix.id }}/binary/codex-oauth-auto.exe"
+            cp "zig-out/bin/codex-oauth-proxy.exe" "artifacts/${{ matrix.id }}/binary/codex-oauth-proxy.exe"
+          fi
+          if [[ "${{ matrix.archive_name }}" == *.zip ]]; then
+            (
+              cd "artifacts/${{ matrix.id }}/binary"
+              zip -q "../${{ matrix.archive_name }}" ./*
+            )
+          else
+            tar -czf "artifacts/${{ matrix.id }}/${{ matrix.archive_name }}" -C "artifacts/${{ matrix.id }}/binary" "${{ matrix.binary_name }}"
+          fi
+
+      - name: Upload artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ matrix.id }}
+          path: artifacts
+
+  publish-release:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build-test, release-assets]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Build release notes
+        uses: actions/github-script@v7
+        env:
+          CURRENT_TAG: ${{ github.ref_name }}
+        with:
+          script: |
+            const fs = require("fs");
+            const cp = require("child_process");
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const currentTag = process.env.CURRENT_TAG;
+
+            function parseTag(tag) {
+              const match = /^v(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(tag);
+              if (!match) return null;
+              return {
+                tag,
+                major: Number(match[1]),
+                minor: Number(match[2]),
+                patch: Number(match[3]),
+                prerelease: match[4] ?? null,
+              };
+            }
+
+            function compareIdentifiers(a, b) {
+              const aIsNumeric = /^\d+$/.test(a);
+              const bIsNumeric = /^\d+$/.test(b);
+              if (aIsNumeric && bIsNumeric) {
+                return Number(a) - Number(b);
+              }
+              if (aIsNumeric) return -1;
+              if (bIsNumeric) return 1;
+              return a.localeCompare(b);
+            }
+
+            function compareSemver(a, b) {
+              if (a.major !== b.major) return a.major - b.major;
+              if (a.minor !== b.minor) return a.minor - b.minor;
+              if (a.patch !== b.patch) return a.patch - b.patch;
+              if (a.prerelease == null && b.prerelease == null) return 0;
+              if (a.prerelease == null) return 1;
+              if (b.prerelease == null) return -1;
+
+              const aParts = a.prerelease.split(".");
+              const bParts = b.prerelease.split(".");
+              const len = Math.max(aParts.length, bParts.length);
+              for (let i = 0; i < len; i += 1) {
+                const aPart = aParts[i];
+                const bPart = bParts[i];
+                if (aPart == null) return -1;
+                if (bPart == null) return 1;
+                const cmp = compareIdentifiers(aPart, bPart);
+                if (cmp !== 0) return cmp;
+              }
+              return 0;
+            }
+
+            function choosePreviousTag(tags, current) {
+              const olderTags = tags
+                .filter((tag) => tag.tag !== current.tag)
+                .filter((tag) => compareSemver(tag, current) < 0)
+                .sort((a, b) => compareSemver(b, a));
+
+              if (current.prerelease == null) {
+                return olderTags.find((tag) => tag.prerelease == null)?.tag ?? null;
+              }
+
+              const sameCorePrerelease = olderTags.find(
+                (tag) =>
+                  tag.major === current.major &&
+                  tag.minor === current.minor &&
+                  tag.patch === current.patch &&
+                  tag.prerelease != null,
+              );
+              if (sameCorePrerelease) return sameCorePrerelease.tag;
+
+              return olderTags.find((tag) => tag.prerelease == null)?.tag ?? olderTags[0]?.tag ?? null;
+            }
+
+            const allTags = cp
+              .execSync("git tag --sort=-version:refname", { encoding: "utf8" })
+              .split("\n")
+              .map((s) => s.trim())
+              .filter(Boolean);
+
+            const parsedTags = allTags.map(parseTag).filter(Boolean);
+            const parsedCurrentTag = parseTag(currentTag);
+            const previousTag = parsedCurrentTag
+              ? choosePreviousTag(parsedTags, parsedCurrentTag)
+              : allTags.find((t) => t !== currentTag) ?? null;
+
+            let compareCommits = [];
+            if (previousTag) {
+              const compare = await github.rest.repos.compareCommitsWithBasehead({
+                owner,
+                repo,
+                basehead: `${previousTag}...${currentTag}`,
+              });
+              compareCommits = compare.data.commits ?? [];
+            } else {
+              const commits = await github.rest.repos.listCommits({
+                owner,
+                repo,
+                sha: currentTag,
+                per_page: 100,
+              });
+              compareCommits = (commits.data ?? []).reverse();
+            }
+
+            const commitLines = compareCommits.map((commit) => {
+              const shortSha = commit.sha.slice(0, 7);
+              const msg = (commit.commit?.message ?? "").split("\n")[0].trim() || shortSha;
+              return `- ${msg} (${shortSha})`;
+            });
+
+            const lines = [];
+            lines.push("## Changelog");
+            lines.push("");
+
+            if (previousTag) {
+              lines.push(`Full Changelog: <a href="https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}"><code>${previousTag}...${currentTag}</code></a>`);
+            } else {
+              lines.push(`Full Changelog: <a href="https://github.com/${owner}/${repo}/commits/${currentTag}"><code>${currentTag}</code></a>`);
+            }
+            lines.push("");
+
+            if (commitLines.length > 0) {
+              lines.push(...commitLines);
+            } else {
+              lines.push("- No code changes detected.");
+            }
+
+            fs.writeFileSync("release-notes.md", lines.join("\n") + "\n");
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body_path: release-notes.md
+          files: |
+            release-assets/*/*.tar.gz
+            release-assets/*/*.zip
+
+  publish-npm:
+    name: Publish npm packages
+    runs-on: ubuntu-latest
+    needs: [build-test, release-assets]
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Check versions
+        run: node scripts/npm/check-versions.mjs ${{ github.ref_name }}
+
+      - name: Stage npm packages
+        run: node scripts/npm/stage-packages.mjs --artifacts-dir artifacts --output-dir dist/npm
+
+      - name: Read package version
+        shell: bash
+        run: |
+          node -e "const fs = require('fs'); const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8')); fs.appendFileSync(process.env.GITHUB_ENV, 'PACKAGE_VERSION=' + pkg.version + '\n');"
+
+      - name: Create pack directory
+        run: mkdir -p ./dist/packed
+
+      - name: Pack root package
+        run: npm pack ./dist/npm/root --pack-destination ./dist/packed
+
+      - name: Pack host platform package
+        run: npm pack ./dist/npm/codex-oauth-linux-x64 --pack-destination ./dist/packed
+
+      - name: Smoke install packed tarballs
+        shell: bash
+        run: |
+          mkdir -p smoke
+          cd smoke
+          npm init -y
+          npm install "../dist/packed/zenith139-codex-oauth-linux-x64-${PACKAGE_VERSION}.tgz" "../dist/packed/zenith139-codex-oauth-${PACKAGE_VERSION}.tgz"
+          ./node_modules/.bin/codex-oauth --version
+
+      - name: Set npm dist-tag
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            echo "NPM_DIST_TAG=next" >> "$GITHUB_ENV"
+          else
+            echo "NPM_DIST_TAG=latest" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish platform packages
+        shell: bash
+        run: |
+          for dir in \
+            codex-oauth-linux-x64 \
+            codex-oauth-linux-arm64 \
+            codex-oauth-darwin-x64 \
+            codex-oauth-darwin-arm64 \
+            codex-oauth-win32-x64 \
+            codex-oauth-win32-arm64
+          do
+            npm publish "./dist/npm/${dir}" --access public --tag "${NPM_DIST_TAG}"
+          done
+
+      - name: Publish root package
+        run: npm publish ./dist/npm/root --access public --tag ${{ env.NPM_DIST_TAG }}
