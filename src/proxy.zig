@@ -11,7 +11,7 @@ const manual_model = "gpt-5.4";
 const manual_model_reasoning_effort = "high";
 const package_root_env_name = "CODEX_OAUTH_PACKAGE_ROOT";
 
-const proxy_service_exec_args = [_][]const u8{ "serve" };
+const proxy_service_exec_args = [_][]const u8{"serve"};
 const proxy_service_spec = managed_service.ManagedServiceSpec{
     .description = "codex-oauth multi-account proxy",
     .linux_service_name = "codex-oauth-proxy.service",
@@ -82,7 +82,7 @@ fn writeManualConfig(out: *std.Io.Writer, cfg: *const registry.ProxyConfig) !voi
         \\[agents.subagent]
         \\model = "{s}"
         \\
-        ,
+    ,
         .{
             manual_model,
             manual_provider_id,
@@ -102,7 +102,7 @@ fn writeManualConfig(out: *std.Io.Writer, cfg: *const registry.ProxyConfig) !voi
         \\  "OPENAI_API_KEY": "{s}"
         \\}}
         \\
-        ,
+    ,
         .{api_key},
     );
     try out.writeAll("```\n");
@@ -507,6 +507,11 @@ fn resolveNodeExecutable(allocator: std.mem.Allocator) ![]u8 {
     };
 }
 
+pub const ServeLaunchOptions = struct {
+    node_executable_override: ?[]const u8 = null,
+    use_service_stdio: bool = false,
+};
+
 fn ensureServeExitedSuccessfully(term: std.process.Child.Term) !void {
     switch (term) {
         .Exited => |code| {
@@ -518,13 +523,20 @@ fn ensureServeExitedSuccessfully(term: std.process.Child.Term) !void {
 }
 
 pub fn runServe(allocator: std.mem.Allocator, codex_home: []const u8) !void {
+    return try runServeWithOptions(allocator, codex_home, .{});
+}
+
+pub fn runServeWithOptions(allocator: std.mem.Allocator, codex_home: []const u8, options: ServeLaunchOptions) !void {
     var reg = try registry.loadRegistry(allocator, codex_home);
     defer reg.deinit(allocator);
     if (try ensureApiKey(allocator, &reg)) {
         try registry.saveRegistry(allocator, codex_home, &reg);
     }
 
-    const node_executable = try resolveNodeExecutable(allocator);
+    const node_executable = if (options.node_executable_override) |override|
+        try allocator.dupe(u8, override)
+    else
+        try resolveNodeExecutable(allocator);
     defer allocator.free(node_executable);
     const runtime_path = try resolveRuntimePath(allocator);
     defer allocator.free(runtime_path);
@@ -535,9 +547,9 @@ pub fn runServe(allocator: std.mem.Allocator, codex_home: []const u8) !void {
         "--codex-home",
         codex_home,
     }, allocator);
-    child.stdin_behavior = .Inherit;
-    child.stdout_behavior = .Inherit;
-    child.stderr_behavior = .Inherit;
+    child.stdin_behavior = if (options.use_service_stdio) .Ignore else .Inherit;
+    child.stdout_behavior = if (options.use_service_stdio) .Ignore else .Inherit;
+    child.stderr_behavior = if (options.use_service_stdio) .Ignore else .Inherit;
 
     const term = try child.spawnAndWait();
     try ensureServeExitedSuccessfully(term);

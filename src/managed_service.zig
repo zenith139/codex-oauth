@@ -18,6 +18,7 @@ pub const ManagedServiceSpec = struct {
 
 const service_version_env_name = "CODEX_OAUTH_VERSION";
 const node_executable_env_name = "CODEX_OAUTH_NODE_EXECUTABLE";
+const windows_node_executable_arg_name = "--node-executable";
 const windows_task_trigger_kind = "LogonTrigger";
 const windows_task_register_trigger_flag = "AtLogOn";
 const windows_task_restart_count = "999";
@@ -278,7 +279,7 @@ fn windowsTaskMatches(allocator: std.mem.Allocator, codex_home: []const u8, self
     _ = codex_home;
     const helper_path = try windowsHelperPath(allocator, self_exe, spec);
     defer allocator.free(helper_path);
-    const expected_action = try windowsExpectedTaskFingerprint(allocator, helper_path);
+    const expected_action = try windowsExpectedTaskFingerprint(allocator, helper_path, spec);
     defer allocator.free(expected_action);
     const expected_fingerprint = try windowsExpectedTaskDefinitionFingerprint(allocator, expected_action);
     defer allocator.free(expected_fingerprint);
@@ -390,9 +391,7 @@ pub fn macPlistText(allocator: std.mem.Allocator, self_exe: []const u8, spec: Ma
     defer allocator.free(env_text);
     var args_builder = std.ArrayList(u8).empty;
     defer args_builder.deinit(allocator);
-    try args_builder.appendSlice(allocator,
-        "  <key>ProgramArguments</key>\n  <array>\n    <string>"
-    );
+    try args_builder.appendSlice(allocator, "  <key>ProgramArguments</key>\n  <array>\n    <string>");
     try args_builder.appendSlice(allocator, exe);
     try args_builder.appendSlice(allocator, "</string>\n");
     for (spec.exec_args) |arg| {
@@ -415,8 +414,10 @@ fn windowsHelperPath(allocator: std.mem.Allocator, self_exe: []const u8, spec: M
     return try std.fs.path.join(allocator, &[_][]const u8{ dir, spec.windows_helper_name });
 }
 
-fn windowsExpectedTaskFingerprint(allocator: std.mem.Allocator, helper_path: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(allocator, "{s} --service-version {s}", .{ helper_path, version.app_version });
+fn windowsExpectedTaskFingerprint(allocator: std.mem.Allocator, helper_path: []const u8, spec: ManagedServiceSpec) ![]u8 {
+    const arguments = try windowsTaskArguments(allocator, spec);
+    defer allocator.free(arguments);
+    return try std.fmt.allocPrint(allocator, "{s} {s}", .{ helper_path, arguments });
 }
 
 fn windowsExpectedTaskDefinitionFingerprint(allocator: std.mem.Allocator, action: []const u8) ![]u8 {
@@ -427,22 +428,53 @@ fn windowsExpectedTaskDefinitionFingerprint(allocator: std.mem.Allocator, action
     );
 }
 
-pub fn windowsTaskAction(allocator: std.mem.Allocator, helper_path: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(allocator, "\"{s}\" --service-version {s}", .{ helper_path, version.app_version });
+pub fn windowsTaskAction(allocator: std.mem.Allocator, helper_path: []const u8, spec: ManagedServiceSpec) ![]u8 {
+    const arguments = try windowsTaskArguments(allocator, spec);
+    defer allocator.free(arguments);
+    return try std.fmt.allocPrint(allocator, "\"{s}\" {s}", .{ helper_path, arguments });
 }
 
 pub fn windowsRegisterTaskScript(allocator: std.mem.Allocator, helper_path: []const u8, spec: ManagedServiceSpec) ![]u8 {
     const escaped_helper_path = try escapePowerShellSingleQuoted(allocator, helper_path);
     defer allocator.free(escaped_helper_path);
-    const escaped_version = try escapePowerShellSingleQuoted(allocator, version.app_version);
-    defer allocator.free(escaped_version);
+    const arguments = try windowsTaskArguments(allocator, spec);
+    defer allocator.free(arguments);
+    const escaped_arguments = try escapePowerShellSingleQuoted(allocator, arguments);
+    defer allocator.free(escaped_arguments);
     const escaped_task_name = try escapePowerShellSingleQuoted(allocator, spec.windows_task_name);
     defer allocator.free(escaped_task_name);
     return try std.fmt.allocPrint(
         allocator,
-        "$action = New-ScheduledTaskAction -Execute '{s}' -Argument '--service-version {s}'; $trigger = New-ScheduledTaskTrigger -{s}; $settings = New-ScheduledTaskSettingsSet -RestartCount {s} -RestartInterval ({s}) -ExecutionTimeLimit ({s}); Register-ScheduledTask -TaskName '{s}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null",
-        .{ escaped_helper_path, escaped_version, windows_task_register_trigger_flag, windows_task_restart_count, windows_task_restart_interval_expr, windows_task_execution_time_limit_expr, escaped_task_name },
+        "$action = New-ScheduledTaskAction -Execute '{s}' -Argument '{s}'; $trigger = New-ScheduledTaskTrigger -{s}; $settings = New-ScheduledTaskSettingsSet -RestartCount {s} -RestartInterval ({s}) -ExecutionTimeLimit ({s}); Register-ScheduledTask -TaskName '{s}' -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null",
+        .{ escaped_helper_path, escaped_arguments, windows_task_register_trigger_flag, windows_task_restart_count, windows_task_restart_interval_expr, windows_task_execution_time_limit_expr, escaped_task_name },
     );
+}
+
+fn windowsTaskArguments(allocator: std.mem.Allocator, spec: ManagedServiceSpec) ![]u8 {
+    return try windowsTaskArgumentsWithNodeExecutable(allocator, spec, null);
+}
+
+fn windowsTaskArgumentsWithNodeExecutable(
+    allocator: std.mem.Allocator,
+    spec: ManagedServiceSpec,
+    node_executable_override: ?[]const u8,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    try out.print(allocator, "--service-version {s}", .{version.app_version});
+    if (spec.requires_node_executable) {
+        const node_executable = if (node_executable_override) |override|
+            try allocator.dupe(u8, override)
+        else
+            try resolveServiceNodeExecutable(allocator);
+        defer allocator.free(node_executable);
+        const quoted_node = try quoteWindowsCommandArg(allocator, node_executable);
+        defer allocator.free(quoted_node);
+        try out.print(allocator, " {s} {s}", .{ windows_node_executable_arg_name, quoted_node });
+    }
+
+    return try out.toOwnedSlice(allocator);
 }
 
 pub fn windowsDeleteTaskScript(allocator: std.mem.Allocator, spec: ManagedServiceSpec) ![]u8 {
@@ -604,6 +636,34 @@ fn escapePowerShellSingleQuoted(allocator: std.mem.Allocator, input: []const u8)
     return std.mem.replaceOwned(u8, allocator, input, "'", "''");
 }
 
+fn quoteWindowsCommandArg(allocator: std.mem.Allocator, arg: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    try out.append(allocator, '"');
+    var trailing_backslashes: usize = 0;
+    for (arg) |ch| {
+        switch (ch) {
+            '\\' => {
+                trailing_backslashes += 1;
+                try out.append(allocator, ch);
+            },
+            '"' => {
+                try out.appendNTimes(allocator, '\\', trailing_backslashes + 1);
+                try out.append(allocator, '"');
+                trailing_backslashes = 0;
+            },
+            else => {
+                trailing_backslashes = 0;
+                try out.append(allocator, ch);
+            },
+        }
+    }
+    try out.appendNTimes(allocator, '\\', trailing_backslashes);
+    try out.append(allocator, '"');
+    return try out.toOwnedSlice(allocator);
+}
+
 fn runChecked(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const result = try runCapture(allocator, argv);
     defer {
@@ -630,4 +690,41 @@ fn runIgnoringFailure(allocator: std.mem.Allocator, argv: []const []const u8) vo
     const result = runCapture(allocator, argv) catch return;
     allocator.free(result.stdout);
     allocator.free(result.stderr);
+}
+
+test "windows task arguments include an explicit node executable for services that require it" {
+    const allocator = std.testing.allocator;
+    const spec = ManagedServiceSpec{
+        .description = "proxy",
+        .linux_service_name = "proxy.service",
+        .mac_label = "com.example.proxy",
+        .windows_task_name = "ProxyTask",
+        .windows_helper_name = "proxy-helper.exe",
+        .exec_args = &.{"serve"},
+        .requires_node_executable = true,
+    };
+
+    const arguments = try windowsTaskArgumentsWithNodeExecutable(allocator, spec, "C:\\Program Files\\nodejs\\node.exe");
+    defer allocator.free(arguments);
+
+    try std.testing.expect(std.mem.indexOf(u8, arguments, "--service-version ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arguments, "--node-executable \"C:\\Program Files\\nodejs\\node.exe\"") != null);
+}
+
+test "windows task arguments omit node executable for services that do not require it" {
+    const allocator = std.testing.allocator;
+    const spec = ManagedServiceSpec{
+        .description = "auto",
+        .linux_service_name = "auto.service",
+        .mac_label = "com.example.auto",
+        .windows_task_name = "AutoTask",
+        .windows_helper_name = "auto-helper.exe",
+        .exec_args = &.{"daemon"},
+    };
+
+    const arguments = try windowsTaskArgumentsWithNodeExecutable(allocator, spec, null);
+    defer allocator.free(arguments);
+
+    try std.testing.expect(std.mem.indexOf(u8, arguments, "--service-version ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arguments, "--node-executable ") == null);
 }

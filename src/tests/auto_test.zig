@@ -1446,7 +1446,7 @@ test "Scenario: Given mac plist when rendering then it includes version metadata
 
 test "Scenario: Given windows task action when rendering then it launches the helper directly without cmd" {
     const gpa = std.testing.allocator;
-    const action = try managed_service.windowsTaskAction(gpa, "C:\\Program Files\\codex-oauth\\codex-oauth-auto.exe");
+    const action = try managed_service.windowsTaskAction(gpa, "C:\\Program Files\\codex-oauth\\codex-oauth-auto.exe", auto_service_spec);
     defer gpa.free(action);
 
     try std.testing.expect(std.mem.indexOf(u8, action, "cmd.exe /D /C") == null);
