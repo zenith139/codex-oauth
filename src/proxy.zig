@@ -9,6 +9,7 @@ const manual_provider_id = "codex_oauth";
 const manual_provider_name = "codex-oauth";
 const manual_model = "gpt-5.4";
 const manual_model_reasoning_effort = "high";
+const package_root_env_name = "CODEX_OAUTH_PACKAGE_ROOT";
 
 const proxy_service_exec_args = [_][]const u8{ "serve" };
 const proxy_service_spec = managed_service.ManagedServiceSpec{
@@ -388,30 +389,115 @@ fn runtimePathForRoot(allocator: std.mem.Allocator, root: []const u8) !?[]u8 {
     return null;
 }
 
-fn resolveRuntimePath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "CODEX_OAUTH_PACKAGE_ROOT")) |package_root| {
-        defer allocator.free(package_root);
+fn runtimePathForInstalledSiblingRoot(allocator: std.mem.Allocator, package_dir: []const u8) !?[]u8 {
+    const package_name = std.fs.path.basename(package_dir);
+    if (!std.mem.startsWith(u8, package_name, manual_provider_name)) return null;
+    if (package_name.len <= manual_provider_name.len or package_name[manual_provider_name.len] != '-') return null;
+
+    const scope_dir = std.fs.path.dirname(package_dir) orelse return null;
+    const sibling_root = try std.fs.path.join(allocator, &[_][]const u8{ scope_dir, manual_provider_name });
+    defer allocator.free(sibling_root);
+    return try runtimePathForRoot(allocator, sibling_root);
+}
+
+fn resolveRuntimePathFromHints(
+    allocator: std.mem.Allocator,
+    package_root_override: ?[]const u8,
+    cwd: []const u8,
+    self_exe: []const u8,
+) ![]u8 {
+    if (package_root_override) |package_root| {
         if (try runtimePathForRoot(allocator, package_root)) |candidate| return candidate;
-    } else |err| switch (err) {
-        error.EnvironmentVariableNotFound => {},
-        else => return err,
     }
 
-    const cwd = try std.process.getCwdAlloc(allocator);
-    defer allocator.free(cwd);
     if (try runtimePathForRoot(allocator, cwd)) |candidate| return candidate;
 
-    const self_exe = try std.fs.selfExePathAlloc(allocator);
-    defer allocator.free(self_exe);
     var dir_slice_opt = std.fs.path.dirname(self_exe);
     var depth: usize = 0;
-    while (dir_slice_opt != null and depth < 4) : (depth += 1) {
+    while (dir_slice_opt != null and depth < 6) : (depth += 1) {
         const dir_slice = dir_slice_opt.?;
         if (try runtimePathForRoot(allocator, dir_slice)) |candidate| return candidate;
+        if (try runtimePathForInstalledSiblingRoot(allocator, dir_slice)) |candidate| return candidate;
         dir_slice_opt = std.fs.path.dirname(dir_slice);
     }
 
     return error.ProxyRuntimeNotFound;
+}
+
+fn resolveRuntimePath(allocator: std.mem.Allocator) ![]u8 {
+    const package_root = std.process.getEnvVarOwned(allocator, package_root_env_name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (package_root) |root| allocator.free(root);
+
+    const cwd = try std.process.getCwdAlloc(allocator);
+    defer allocator.free(cwd);
+
+    const self_exe = try std.fs.selfExePathAlloc(allocator);
+    defer allocator.free(self_exe);
+
+    return try resolveRuntimePathFromHints(allocator, package_root, cwd, self_exe);
+}
+
+test "resolve runtime path finds the root package next to an installed platform package" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(cwd);
+
+    try tmp.dir.makePath("global/node_modules/@zenith139/codex-oauth/runtime");
+    try tmp.dir.makePath("global/node_modules/@zenith139/codex-oauth-win32-x64/bin");
+    try tmp.dir.writeFile(.{
+        .sub_path = "global/node_modules/@zenith139/codex-oauth/runtime/serve.mjs",
+        .data = "console.log('ok');\n",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "global/node_modules/@zenith139/codex-oauth-win32-x64/bin/codex-oauth-proxy.exe",
+        .data = "",
+    });
+
+    const self_exe = try tmp.dir.realpathAlloc(gpa, "global/node_modules/@zenith139/codex-oauth-win32-x64/bin/codex-oauth-proxy.exe");
+    defer gpa.free(self_exe);
+
+    const runtime_path = try resolveRuntimePathFromHints(gpa, null, cwd, self_exe);
+    defer gpa.free(runtime_path);
+
+    const expected = try tmp.dir.realpathAlloc(gpa, "global/node_modules/@zenith139/codex-oauth/runtime/serve.mjs");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, runtime_path);
+}
+
+test "resolve runtime path still honors an explicit package root override" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("custom-root/runtime");
+    try tmp.dir.writeFile(.{
+        .sub_path = "custom-root/runtime/serve.mjs",
+        .data = "console.log('ok');\n",
+    });
+
+    const package_root = try tmp.dir.realpathAlloc(gpa, "custom-root");
+    defer gpa.free(package_root);
+    const cwd = try tmp.dir.realpathAlloc(gpa, ".");
+    defer gpa.free(cwd);
+    try tmp.dir.writeFile(.{
+        .sub_path = "custom-root/codex-oauth-proxy.exe",
+        .data = "",
+    });
+    const self_exe = try tmp.dir.realpathAlloc(gpa, "custom-root/codex-oauth-proxy.exe");
+    defer gpa.free(self_exe);
+
+    const runtime_path = try resolveRuntimePathFromHints(gpa, package_root, cwd, self_exe);
+    defer gpa.free(runtime_path);
+
+    const expected = try tmp.dir.realpathAlloc(gpa, "custom-root/runtime/serve.mjs");
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, runtime_path);
 }
 
 fn resolveNodeExecutable(allocator: std.mem.Allocator) ![]u8 {
