@@ -1,5 +1,10 @@
 FROM node:20-bookworm-slim
 
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates curl \
+  && update-ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN npm install -g @openai/codex @zenith139/codex-oauth
 
 ENV CODEX_HOME=/home/codex/.codex

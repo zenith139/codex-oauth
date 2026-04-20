@@ -5,6 +5,10 @@ services:
       dockerfile: Dockerfile
     container_name: codex-oauth
     user: "0:0"
+    environment:
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
     ports:
       - "${APP_PORT:-4318}:4318"
       - "1455:1455"
