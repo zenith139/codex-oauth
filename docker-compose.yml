@@ -6,7 +6,7 @@ services:
     container_name: codex-oauth
     user: "0:0"
     ports:
-      - "${APP_PORT:-4318}:${APP_PORT:-4318}"
+      - "${APP_PORT:-4318}:4318"
       - "1455:1455"
     volumes:
       - codex-home:/home/codex/.codex
