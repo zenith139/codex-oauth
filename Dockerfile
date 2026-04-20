@@ -8,6 +8,7 @@ RUN apt-get update \
 RUN npm install -g @openai/codex @zenith139/codex-oauth
 
 ENV CODEX_HOME=/home/codex/.codex
+ENV HOME=/home/codex
 ENV PATH=/home/codex/.npm-global/bin:${PATH}
 
 RUN mkdir -p /home/codex/.codex
