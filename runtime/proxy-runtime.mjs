@@ -812,6 +812,123 @@ function encodeJsonBuffer(value) {
   return Buffer.from(JSON.stringify(value), "utf8");
 }
 
+function buildChatCompletionChunk({ id, model, created, delta = {}, finishReason = null }) {
+  return {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model,
+    choices: [
+      {
+        index: 0,
+        delta,
+        finish_reason: finishReason
+      }
+    ]
+  };
+}
+
+async function relayResponsesStreamAsChatCompletions(res, upstreamResponse, model, nowMs) {
+  res.writeHead(upstreamResponse.status, {
+    "Content-Type": "text/event-stream; charset=utf-8",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+
+  if (!upstreamResponse.body) {
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  const streamModel = typeof model === "string" && model.length > 0 ? model : "gpt-5.3-codex";
+  const created = Math.floor(nowMs / 1000);
+  const bodyStream = Readable.fromWeb(upstreamResponse.body);
+  let pending = "";
+  let chunkId = `chatcmpl-${nowMs}`;
+  let emittedRole = false;
+  let emittedDone = false;
+
+  const emitChunk = (delta, finishReason = null) => {
+    if (res.destroyed) return;
+    const chunk = buildChatCompletionChunk({
+      id: chunkId,
+      model: streamModel,
+      created,
+      delta,
+      finishReason
+    });
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+  };
+
+  bodyStream.on("error", () => {
+    if (!res.destroyed) {
+      res.destroy();
+    }
+  });
+  res.on("close", () => {
+    bodyStream.destroy();
+  });
+
+  const processSseLine = (line) => {
+    if (!line.startsWith("data: ")) return;
+    const payload = line.slice(6);
+    if (payload === "[DONE]") return;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    parsed = normalizeResponsesEventForLiteLLM(parsed);
+    if (typeof parsed?.response?.id === "string" && parsed.response.id.length > 0) {
+      chunkId = parsed.response.id;
+    }
+    if (parsed?.type === "response.output_text.delta") {
+      const deltaText = coerceText(parsed.delta);
+      if (!deltaText) return;
+      if (!emittedRole) {
+        emittedRole = true;
+        emitChunk({ role: "assistant", content: deltaText }, null);
+      } else {
+        emitChunk({ content: deltaText }, null);
+      }
+      return;
+    }
+    if (parsed?.type === "response.completed") {
+      emitChunk({}, "stop");
+      if (!res.destroyed) {
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }
+      emittedDone = true;
+    }
+  };
+
+  bodyStream.on("data", (chunk) => {
+    pending += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    let lineBreakIdx = pending.indexOf("\n");
+    while (lineBreakIdx !== -1) {
+      const line = pending.slice(0, lineBreakIdx);
+      pending = pending.slice(lineBreakIdx + 1);
+      processSseLine(line);
+      lineBreakIdx = pending.indexOf("\n");
+    }
+  });
+
+  bodyStream.on("end", () => {
+    if (emittedDone || res.destroyed) return;
+    if (pending.length > 0) {
+      processSseLine(pending);
+    }
+    if (!emittedDone && !res.destroyed) {
+      emitChunk({}, "stop");
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  });
+}
+
 async function forwardUpstreamRequest(account, req, bodyBuffer, ctx) {
   const headers = {
     Authorization: `Bearer ${account.accessToken}`,
@@ -1016,16 +1133,13 @@ export class ProxyRuntime {
       writeJson(res, 400, openAIError("Request body must be valid JSON.", "invalid_json", "invalid_request_error"));
       return;
     }
-    if (requestJson.stream === true) {
-      writeJson(res, 400, openAIError("Streaming chat completions are not supported. Use /v1/responses for stream mode.", "unsupported_stream", "invalid_request_error"));
-      return;
-    }
-
     const normalizedResponseRequest = normalizeResponsesRequest({
       model: requestJson.model,
       instructions: collectSystemInstructions(requestJson.messages),
       input: messagesToInput(requestJson.messages),
+      stream: requestJson.stream === true,
       max_output_tokens: requestJson.max_completion_tokens,
+      max_tokens: requestJson.max_tokens,
       reasoning: requestJson.reasoning,
       reasoning_effort: requestJson.reasoning_effort,
       temperature: requestJson.temperature,
@@ -1092,6 +1206,10 @@ export class ProxyRuntime {
 
         if (upstreamResponse.ok) {
           this.router.clearSuccess(account.accountKey, model, this.now());
+          if (requestJson.stream === true) {
+            await relayResponsesStreamAsChatCompletions(res, upstreamResponse, model, this.now());
+            return;
+          }
           const responseJson = await upstreamResponse.json().catch(() => null);
           if (!responseJson) {
             writeJson(res, 502, openAIError("Upstream returned non-JSON response.", null, "upstream_error"));
@@ -1174,6 +1292,11 @@ export class ProxyRuntime {
     }
 
     if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      await this.handleChatCompletions(req, res, config);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/messages") {
       await this.handleChatCompletions(req, res, config);
       return;
     }

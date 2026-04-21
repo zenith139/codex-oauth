@@ -415,6 +415,125 @@ test("proxy runtime maps chat completions payloads into responses format for Lit
   }
 });
 
+test("proxy runtime supports /v1/messages as a chat completions compatibility alias", async () => {
+  let upstreamBody = null;
+  const account = makeAccount({
+    email: "alpha@example.com",
+    userId: "user-alpha",
+    accountId: "acct-alpha",
+    accessToken: "token-alpha",
+    refreshToken: "refresh-alpha"
+  });
+  const harness = await startProxyRuntime({
+    accounts: [account],
+    upstreamHandler(req, res) {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        upstreamBody = JSON.parse(body);
+        jsonResponse(res, 200, {
+          id: "resp-messages-1",
+          usage: { input_tokens: 3, output_tokens: 4, total_tokens: 7 },
+          output: [
+            {
+              content: [
+                { type: "output_text", text: "hello from messages endpoint" }
+              ]
+            }
+          ]
+        });
+      });
+    },
+    refreshHandler(req, res) {
+      jsonResponse(res, 500, { error: "unexpected" });
+    }
+  });
+  try {
+    const response = await fetch(`${harness.baseUrl.replace("/v1", "")}/v1/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${harness.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.3-codex",
+        max_tokens: 256,
+        messages: [
+          { role: "system", content: "Be concise." },
+          { role: "user", content: "Say hello." }
+        ]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBody.max_output_tokens, 256);
+    const body = await response.json();
+    assert.equal(body.object, "chat.completion");
+    assert.equal(body.choices[0].message.content, "hello from messages endpoint");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("proxy runtime supports /v1/messages with stream=true", async () => {
+  const account = makeAccount({
+    email: "alpha@example.com",
+    userId: "user-alpha",
+    accountId: "acct-alpha",
+    accessToken: "token-alpha",
+    refreshToken: "refresh-alpha"
+  });
+  const harness = await startProxyRuntime({
+    accounts: [account],
+    upstreamHandler(req, res) {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        const parsed = JSON.parse(body);
+        assert.equal(parsed.stream, true);
+        res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+        res.write("event: response.created\n");
+        res.write("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-stream-1\"}}\n\n");
+        res.write("event: response.output_text.delta\n");
+        res.write("data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n");
+        res.write("event: response.output_text.delta\n");
+        res.write("data: {\"type\":\"response.output_text.delta\",\"delta\":\"!\"}\n\n");
+        res.end("data: {\"type\":\"response.completed\"}\n\n");
+      });
+    },
+    refreshHandler(req, res) {
+      jsonResponse(res, 500, { error: "unexpected" });
+    }
+  });
+  try {
+    const response = await fetch(`${harness.baseUrl.replace("/v1", "")}/v1/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${harness.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.3-codex",
+        stream: true,
+        messages: [
+          { role: "user", content: "Say hello." }
+        ]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get("content-type") || "", /text\/event-stream/);
+    const body = await response.text();
+    assert.ok(body.includes("\"object\":\"chat.completion.chunk\""));
+    assert.ok(body.includes("\"role\":\"assistant\""));
+    assert.ok(body.includes("\"content\":\"Hello\""));
+    assert.ok(body.includes("\"content\":\"!\""));
+    assert.ok(body.includes("data: [DONE]"));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("proxy runtime falls through to another account on 429 within the same request", async () => {
   const seen = [];
   const harness = await startProxyRuntime({
