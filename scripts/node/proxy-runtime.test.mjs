@@ -458,6 +458,23 @@ test("proxy runtime supports /v1/messages as a chat completions compatibility al
       body: JSON.stringify({
         model: "gpt-5.3-codex",
         max_tokens: 256,
+        tool_choice: "auto",
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "get_weather",
+              description: "Get weather by city",
+              parameters: {
+                type: "object",
+                properties: {
+                  city: { type: "string" }
+                },
+                required: ["city"]
+              }
+            }
+          }
+        ],
         messages: [
           { role: "system", content: "Be concise." },
           { role: "user", content: "Say hello." }
@@ -467,6 +484,9 @@ test("proxy runtime supports /v1/messages as a chat completions compatibility al
 
     assert.equal(response.status, 200);
     assert.equal(upstreamBody.max_output_tokens, 256);
+    assert.equal(upstreamBody.tool_choice, "auto");
+    assert.equal(Array.isArray(upstreamBody.tools), true);
+    assert.equal(upstreamBody.tools[0].function.name, "get_weather");
     const body = await response.json();
     assert.equal(body.object, "chat.completion");
     assert.equal(body.choices[0].message.content, "hello from messages endpoint");

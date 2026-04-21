@@ -1144,7 +1144,10 @@ export class ProxyRuntime {
       reasoning_effort: requestJson.reasoning_effort,
       temperature: requestJson.temperature,
       top_p: requestJson.top_p,
-      metadata: requestJson.metadata
+      metadata: requestJson.metadata,
+      tools: requestJson.tools,
+      tool_choice: requestJson.tool_choice,
+      parallel_tool_calls: requestJson.parallel_tool_calls
     });
     const responseBodyBuffer = encodeJsonBuffer(normalizedResponseRequest);
     const model = typeof normalizedResponseRequest.model === "string" && normalizedResponseRequest.model.length > 0
