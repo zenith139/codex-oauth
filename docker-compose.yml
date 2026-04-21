@@ -7,6 +7,7 @@ services:
     user: "0:0"
     environment:
       - HOME=/home/codex
+      - CODEX_OAUTH_API_KEY=${CODEX_OAUTH_API_KEY:-sk-litellm-dev}
       - HTTP_PROXY=${HTTP_PROXY:-}
       - HTTPS_PROXY=${HTTPS_PROXY:-}
       - NO_PROXY=${NO_PROXY:-}
@@ -16,7 +17,46 @@ services:
     volumes:
       - codex-home:/home/codex/.codex
     restart: unless-stopped
-    # entrypoint: ["tail", "-f", "/dev/null"]
+
+  # litellm:
+  #   image: ghcr.io/berriai/litellm:main-latest
+  #   container_name: litellm
+  #   depends_on:
+  #     litellm-db:
+  #       condition: service_healthy
+  #     codex-oauth:
+  #       condition: service_started
+  #   ports:
+  #     - "${LITELLM_PORT:-4000}:4000"
+  #   environment:
+  #     - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-litellm-dev}
+  #     - LITELLM_SALT_KEY=${LITELLM_SALT_KEY:-litellm-salt-change-me}
+  #     - DATABASE_URL=postgresql://${LITELLM_DB_USER:-litellm}:${LITELLM_DB_PASSWORD:-litellm}@litellm-db:5432/${LITELLM_DB_NAME:-litellm}
+  #     - STORE_MODEL_IN_DB=True
+  #     - UI_USERNAME=${LITELLM_UI_USERNAME:-admin}
+  #     - UI_PASSWORD=${LITELLM_UI_PASSWORD:-sk-litellm-dev}
+  #     - CODEX_OAUTH_API_KEY=${CODEX_OAUTH_API_KEY:-sk-litellm-dev}
+  #   volumes:
+  #     - ./litellm-config.yaml:/app/config.yaml:ro
+  #   command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
+  #   restart: unless-stopped
+
+  # litellm-db:
+  #   image: postgres:16-alpine
+  #   container_name: litellm-db
+  #   environment:
+  #     - POSTGRES_DB=${LITELLM_DB_NAME:-litellm}
+  #     - POSTGRES_USER=${LITELLM_DB_USER:-litellm}
+  #     - POSTGRES_PASSWORD=${LITELLM_DB_PASSWORD:-litellm}
+  #   volumes:
+  #     - litellm-db-data:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U ${LITELLM_DB_USER:-litellm} -d ${LITELLM_DB_NAME:-litellm}"]
+  #     interval: 5s
+  #     timeout: 5s
+  #     retries: 20
+  #   restart: unless-stopped
 
 volumes:
   codex-home:
+  # litellm-db-data:

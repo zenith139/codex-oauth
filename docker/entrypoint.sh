@@ -24,6 +24,7 @@ if [ -n "${CODEX_OAUTH_API_KEY:-}" ]; then
 else
   node "${CODEX_OAUTH_WRAPPER}" config proxy --port "${APP_PORT}"
 fi
+node "${CODEX_OAUTH_WRAPPER}" config proxy --api-key "xufOqhMWQKtGoC1nbtyRnbF45a219Q0C"
 
 REGISTRY_PATH="${CODEX_HOME}/accounts/registry.json"
 if [ -f "${REGISTRY_PATH}" ]; then

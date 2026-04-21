@@ -274,7 +274,7 @@ test("proxy runtime rotates accounts with sticky round robin", async () => {
   }
 });
 
-test("proxy runtime forwards reasoning effort without rewriting request body", async () => {
+test("proxy runtime forwards reasoning effort and injects default instructions when missing", async () => {
   let upstreamBody = null;
   const account = makeAccount({
     email: "alpha@example.com",
@@ -317,7 +317,99 @@ test("proxy runtime forwards reasoning effort without rewriting request body", a
     });
 
     assert.equal(response.status, 200);
-    assert.deepEqual(upstreamBody, requestBody);
+    assert.equal(upstreamBody.model, requestBody.model);
+    assert.deepEqual(upstreamBody.input, [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: requestBody.input
+          }
+        ]
+      }
+    ]);
+    assert.equal(upstreamBody.reasoning?.effort, "high");
+    assert.equal(upstreamBody.reasoning_effort, "high");
+    assert.equal(upstreamBody.instructions, "You are a helpful assistant.");
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("proxy runtime maps chat completions payloads into responses format for LiteLLM clients", async () => {
+  let upstreamBody = null;
+  const account = makeAccount({
+    email: "alpha@example.com",
+    userId: "user-alpha",
+    accountId: "acct-alpha",
+    accessToken: "token-alpha",
+    refreshToken: "refresh-alpha"
+  });
+  const harness = await startProxyRuntime({
+    accounts: [account],
+    upstreamHandler(req, res) {
+      let body = "";
+      req.on("data", (chunk) => { body += chunk; });
+      req.on("end", () => {
+        upstreamBody = JSON.parse(body);
+        jsonResponse(res, 200, {
+          id: "resp-123",
+          usage: { input_tokens: 5, output_tokens: 7, total_tokens: 12 },
+          output: [
+            {
+              content: [
+                { type: "output_text", text: "hello from codex-oauth" }
+              ]
+            }
+          ]
+        });
+      });
+    },
+    refreshHandler(req, res) {
+      jsonResponse(res, 500, { error: "unexpected" });
+    }
+  });
+  try {
+    const response = await fetch(`${harness.baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${harness.apiKey}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: "gpt-5.3-codex",
+        messages: [
+          { role: "system", content: "Keep answers concise." },
+          { role: "user", content: "Say hello." }
+        ]
+      })
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamBody.instructions, "Keep answers concise.");
+    assert.deepEqual(upstreamBody.input, [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "[user] Say hello."
+          }
+        ]
+      }
+    ]);
+    assert.equal(upstreamBody.store, false);
+    const body = await response.json();
+    assert.equal(body.object, "chat.completion");
+    assert.equal(body.model, "gpt-5.3-codex");
+    assert.equal(body.choices[0].message.role, "assistant");
+    assert.equal(body.choices[0].message.content, "hello from codex-oauth");
+    assert.equal(body.usage.prompt_tokens, 5);
+    assert.equal(body.usage.completion_tokens, 7);
+    assert.equal(body.usage.total_tokens, 12);
   } finally {
     await harness.cleanup();
   }
@@ -502,6 +594,37 @@ test("proxy runtime relays SSE responses end to end", async () => {
     assert.ok(body.includes("data: first"));
     assert.ok(body.includes("data: second"));
     assert.ok(body.includes("data: [DONE]"));
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("proxy runtime normalizes SSE reasoning effort for LiteLLM compatibility", async () => {
+  const account = makeAccount({
+    email: "alpha@example.com",
+    userId: "user-alpha",
+    accountId: "acct-alpha",
+    accessToken: "token-alpha",
+    refreshToken: "refresh-alpha"
+  });
+  const harness = await startProxyRuntime({
+    accounts: [account],
+    upstreamHandler(req, res) {
+      res.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8" });
+      res.write("event: response.created\n");
+      res.write("data: {\"type\":\"response.created\",\"response\":{\"reasoning\":{\"effort\":\"none\"}}}\n\n");
+      res.end("data: [DONE]\n\n");
+    },
+    refreshHandler(req, res) {
+      jsonResponse(res, 500, { error: "unexpected" });
+    }
+  });
+  try {
+    const response = await proxyRequest(harness.baseUrl, harness.apiKey);
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.ok(body.includes("\"effort\":\"minimal\""));
+    assert.ok(!body.includes("\"effort\":\"none\""));
   } finally {
     await harness.cleanup();
   }

@@ -575,7 +575,9 @@ function filteredResponseHeaders(responseHeaders) {
 }
 
 async function relayUpstreamResponse(res, upstreamResponse) {
-  res.writeHead(upstreamResponse.status, filteredResponseHeaders(upstreamResponse.headers));
+  const headers = filteredResponseHeaders(upstreamResponse.headers);
+
+  res.writeHead(upstreamResponse.status, headers);
   if (!upstreamResponse.body) {
     res.end();
     return;
@@ -590,7 +592,52 @@ async function relayUpstreamResponse(res, upstreamResponse) {
   res.on("close", () => {
     bodyStream.destroy();
   });
-  bodyStream.pipe(res);
+
+  let pending = "";
+  bodyStream.on("data", (chunk) => {
+    pending += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+    let lineBreakIdx = pending.indexOf("\n");
+    while (lineBreakIdx !== -1) {
+      const line = pending.slice(0, lineBreakIdx);
+      pending = pending.slice(lineBreakIdx + 1);
+      if (!res.destroyed) {
+        res.write(`${normalizeSseLineForLiteLLM(line)}\n`);
+      }
+      lineBreakIdx = pending.indexOf("\n");
+    }
+  });
+  bodyStream.on("end", () => {
+    if (!res.destroyed) {
+      if (pending.length > 0) {
+        res.write(normalizeSseLineForLiteLLM(pending));
+      }
+      res.end();
+    }
+  });
+}
+
+function normalizeResponsesEventForLiteLLM(event) {
+  if (!event || typeof event !== "object") return event;
+  if (event.response && typeof event.response === "object" && event.response.reasoning && typeof event.response.reasoning === "object") {
+    if (event.response.reasoning.effort === "none") {
+      event.response.reasoning.effort = "minimal";
+    }
+  }
+  return event;
+}
+
+function normalizeSseLineForLiteLLM(line) {
+  if (!line.startsWith("data: ")) return line;
+  const payload = line.slice(6);
+  if (payload === "[DONE]") return line;
+  let parsed;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return line;
+  }
+  const normalized = normalizeResponsesEventForLiteLLM(parsed);
+  return `data: ${JSON.stringify(normalized)}`;
 }
 
 function buildModelList() {
@@ -615,6 +662,154 @@ function bearerTokenFromHeader(headerValue) {
   if (typeof headerValue !== "string") return null;
   const match = headerValue.match(/^Bearer\s+(.+)$/i);
   return match ? match[1] : null;
+}
+
+function coerceText(value) {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  return String(value);
+}
+
+function messageContentToText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const item of content) {
+    if (typeof item === "string") {
+      parts.push(item);
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "text" || item.type === "output_text" || item.type === "input_text") {
+      const text = coerceText(item.text).trim();
+      if (text) parts.push(text);
+    }
+  }
+  return parts.join("\n").trim();
+}
+
+function messagesToInput(messages) {
+  if (!Array.isArray(messages)) return "";
+  const blocks = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    if (message.role === "system") continue;
+    const role = typeof message.role === "string" && message.role.length > 0 ? message.role : "user";
+    const text = messageContentToText(message.content).trim();
+    if (!text) continue;
+    blocks.push(`[${role}] ${text}`);
+  }
+  return blocks.join("\n\n").trim();
+}
+
+function normalizeInputField(input) {
+  if (Array.isArray(input)) return input;
+  if (typeof input === "string" && input.trim().length > 0) {
+    return [
+      {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: input
+          }
+        ]
+      }
+    ];
+  }
+  return input;
+}
+
+function collectSystemInstructions(messages) {
+  if (!Array.isArray(messages)) return "";
+  const parts = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object" || message.role !== "system") continue;
+    const text = messageContentToText(message.content).trim();
+    if (text) parts.push(text);
+  }
+  return parts.join("\n\n").trim();
+}
+
+function normalizeResponsesRequest(requestJson) {
+  const normalized = { ...requestJson };
+  if (typeof normalized.instructions !== "string" || normalized.instructions.trim().length === 0) {
+    const fromMessages = collectSystemInstructions(normalized.messages);
+    normalized.instructions = fromMessages || "You are a helpful assistant.";
+  }
+  if (normalized.input == null || (typeof normalized.input === "string" && normalized.input.trim().length === 0)) {
+    const mappedInput = messagesToInput(normalized.messages);
+    if (mappedInput) normalized.input = mappedInput;
+  }
+  normalized.input = normalizeInputField(normalized.input);
+  if (normalized.max_output_tokens == null && Number.isInteger(normalized.max_tokens) && normalized.max_tokens > 0) {
+    normalized.max_output_tokens = normalized.max_tokens;
+  }
+  normalized.store = false;
+  delete normalized.metadata;
+  delete normalized.user;
+  delete normalized.n;
+  delete normalized.messages;
+  return normalized;
+}
+
+function extractResponseOutputText(responseJson) {
+  if (!responseJson || typeof responseJson !== "object") return "";
+  if (typeof responseJson.output_text === "string") return responseJson.output_text;
+  const outputs = Array.isArray(responseJson.output) ? responseJson.output : [];
+  const texts = [];
+  for (const output of outputs) {
+    if (!output || typeof output !== "object") continue;
+    const content = Array.isArray(output.content) ? output.content : [];
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+      if (item.type === "output_text" || item.type === "text") {
+        const text = coerceText(item.text).trim();
+        if (text) texts.push(text);
+      }
+    }
+  }
+  return texts.join("\n").trim();
+}
+
+function buildChatCompletionResponse(responseJson, model, nowMs) {
+  const outputText = extractResponseOutputText(responseJson);
+  const usage = responseJson?.usage && typeof responseJson.usage === "object"
+    ? {
+        prompt_tokens: Number.isInteger(responseJson.usage.input_tokens) ? responseJson.usage.input_tokens : 0,
+        completion_tokens: Number.isInteger(responseJson.usage.output_tokens) ? responseJson.usage.output_tokens : 0,
+        total_tokens: Number.isInteger(responseJson.usage.total_tokens)
+          ? responseJson.usage.total_tokens
+          : (Number.isInteger(responseJson.usage.input_tokens) ? responseJson.usage.input_tokens : 0) +
+            (Number.isInteger(responseJson.usage.output_tokens) ? responseJson.usage.output_tokens : 0)
+      }
+    : undefined;
+
+  const body = {
+    id: typeof responseJson?.id === "string" && responseJson.id.length > 0 ? responseJson.id : `chatcmpl-${nowMs}`,
+    object: "chat.completion",
+    created: Math.floor(nowMs / 1000),
+    model: typeof model === "string" && model.length > 0 ? model : "gpt-5.3-codex",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: outputText
+        },
+        finish_reason: "stop"
+      }
+    ]
+  };
+  if (usage) {
+    body.usage = usage;
+  }
+  return body;
+}
+
+function encodeJsonBuffer(value) {
+  return Buffer.from(JSON.stringify(value), "utf8");
 }
 
 async function forwardUpstreamRequest(account, req, bodyBuffer, ctx) {
@@ -696,7 +891,9 @@ export class ProxyRuntime {
       writeJson(res, 400, openAIError("Request body must be valid JSON.", "invalid_json", "invalid_request_error"));
       return;
     }
-    const model = typeof requestJson.model === "string" && requestJson.model.length > 0 ? requestJson.model : null;
+    const normalizedRequest = normalizeResponsesRequest(requestJson);
+    const normalizedBodyBuffer = encodeJsonBuffer(normalizedRequest);
+    const model = typeof normalizedRequest.model === "string" && normalizedRequest.model.length > 0 ? normalizedRequest.model : null;
 
     const accounts = await loadChatgptAccounts(this.codexHome, config.registry);
     if (accounts.length === 0) {
@@ -728,12 +925,12 @@ export class ProxyRuntime {
 
       let activeAccount = await maybeRefreshProactively(account, this);
       try {
-        let upstreamResponse = await forwardUpstreamRequest(activeAccount, req, bodyBuffer, this);
+        let upstreamResponse = await forwardUpstreamRequest(activeAccount, req, normalizedBodyBuffer, this);
         if (upstreamResponse.status === 401 && activeAccount.refreshToken) {
           await drainResponse(upstreamResponse);
           try {
             activeAccount = await refreshAccountTokens(activeAccount, this);
-            upstreamResponse = await forwardUpstreamRequest(activeAccount, req, bodyBuffer, this);
+            upstreamResponse = await forwardUpstreamRequest(activeAccount, req, normalizedBodyBuffer, this);
           } catch (refreshError) {
             const errorText = typeof refreshError?.bodyText === "string" ? refreshError.bodyText : refreshError?.message || "token refresh failed";
             const fallback = this.router.markUnavailable(account.accountKey, {
@@ -754,6 +951,153 @@ export class ProxyRuntime {
         if (upstreamResponse.ok) {
           this.router.clearSuccess(account.accountKey, model, this.now());
           await relayUpstreamResponse(res, upstreamResponse);
+          return;
+        }
+
+        const errorText = await upstreamResponse.text().catch(() => "");
+        const fallback = this.router.markUnavailable(account.accountKey, {
+          status: upstreamResponse.status,
+          errorText,
+          model,
+          nowMs: this.now()
+        });
+        lastError = {
+          status: upstreamResponse.status,
+          message: extractErrorMessage(errorText, upstreamResponse.status),
+          retryAfterMs: fallback.retryUntilMs != null ? Math.max(fallback.retryUntilMs - this.now(), 0) : null
+        };
+
+        if (!fallback.shouldFallback) {
+          writeJson(res, upstreamResponse.status, openAIError(lastError.message, null, "upstream_error"));
+          return;
+        }
+      } catch (error) {
+        const fallback = this.router.markUnavailable(account.accountKey, {
+          status: 503,
+          errorText: error?.message || "network error",
+          model,
+          nowMs: this.now()
+        });
+        lastError = {
+          status: 503,
+          message: error?.message || "network error",
+          retryAfterMs: fallback.retryUntilMs != null ? Math.max(fallback.retryUntilMs - this.now(), 0) : null
+        };
+      }
+    }
+
+    const retryAfterMs = lastSelection?.retryAfterMs != null
+      ? Math.max(lastSelection.retryAfterMs - this.now(), 0)
+      : lastError?.retryAfterMs ?? null;
+    const statusCode = retryAfterMs != null ? 429 : (lastError?.status || 503);
+    const headers = {};
+    if (retryAfterMs != null) {
+      headers["Retry-After"] = String(Math.max(1, Math.ceil(retryAfterMs / 1000)));
+    }
+    writeJson(
+      res,
+      statusCode,
+      openAIError(lastError?.message || "All accounts are temporarily unavailable.", "all_accounts_unavailable", "upstream_error"),
+      headers
+    );
+  }
+
+  async handleChatCompletions(req, res, config) {
+    let bodyBuffer;
+    try {
+      bodyBuffer = await readBody(req);
+    } catch (error) {
+      writeJson(res, 413, openAIError(error.message, "request_too_large", "invalid_request_error"));
+      return;
+    }
+
+    const requestJson = safeJsonParse(bodyBuffer.toString("utf8"));
+    if (!requestJson || typeof requestJson !== "object") {
+      writeJson(res, 400, openAIError("Request body must be valid JSON.", "invalid_json", "invalid_request_error"));
+      return;
+    }
+    if (requestJson.stream === true) {
+      writeJson(res, 400, openAIError("Streaming chat completions are not supported. Use /v1/responses for stream mode.", "unsupported_stream", "invalid_request_error"));
+      return;
+    }
+
+    const normalizedResponseRequest = normalizeResponsesRequest({
+      model: requestJson.model,
+      instructions: collectSystemInstructions(requestJson.messages),
+      input: messagesToInput(requestJson.messages),
+      max_output_tokens: requestJson.max_completion_tokens,
+      reasoning: requestJson.reasoning,
+      reasoning_effort: requestJson.reasoning_effort,
+      temperature: requestJson.temperature,
+      top_p: requestJson.top_p,
+      metadata: requestJson.metadata
+    });
+    const responseBodyBuffer = encodeJsonBuffer(normalizedResponseRequest);
+    const model = typeof normalizedResponseRequest.model === "string" && normalizedResponseRequest.model.length > 0
+      ? normalizedResponseRequest.model
+      : null;
+
+    const accounts = await loadChatgptAccounts(this.codexHome, config.registry);
+    if (accounts.length === 0) {
+      writeJson(res, 503, openAIError("No stored ChatGPT OAuth accounts are available for proxy routing.", "no_accounts"));
+      return;
+    }
+
+    const excluded = new Set();
+    let lastError = null;
+    let lastSelection = null;
+    while (excluded.size < accounts.length) {
+      const selection = this.router.selectAccount(accounts, {
+        strategy: config.proxy.strategy,
+        stickyRoundRobinLimit: config.proxy.sticky_round_robin_limit
+      }, {
+        model,
+        excludeAccountKeys: [...excluded],
+        nowMs: this.now()
+      });
+      lastSelection = selection;
+      if (!selection.accountKey) break;
+
+      const account = accounts.find((entry) => entry.accountKey === selection.accountKey);
+      if (!account) {
+        excluded.add(selection.accountKey);
+        continue;
+      }
+      excluded.add(account.accountKey);
+
+      let activeAccount = await maybeRefreshProactively(account, this);
+      try {
+        let upstreamResponse = await forwardUpstreamRequest(activeAccount, req, responseBodyBuffer, this);
+        if (upstreamResponse.status === 401 && activeAccount.refreshToken) {
+          await drainResponse(upstreamResponse);
+          try {
+            activeAccount = await refreshAccountTokens(activeAccount, this);
+            upstreamResponse = await forwardUpstreamRequest(activeAccount, req, responseBodyBuffer, this);
+          } catch (refreshError) {
+            const errorText = typeof refreshError?.bodyText === "string" ? refreshError.bodyText : refreshError?.message || "token refresh failed";
+            const fallback = this.router.markUnavailable(account.accountKey, {
+              status: refreshError?.status || 401,
+              errorText,
+              model,
+              nowMs: this.now()
+            });
+            lastError = {
+              status: refreshError?.status || 401,
+              message: extractErrorMessage(errorText, refreshError?.status || 401),
+              retryAfterMs: fallback.retryUntilMs != null ? Math.max(fallback.retryUntilMs - this.now(), 0) : null
+            };
+            continue;
+          }
+        }
+
+        if (upstreamResponse.ok) {
+          this.router.clearSuccess(account.accountKey, model, this.now());
+          const responseJson = await upstreamResponse.json().catch(() => null);
+          if (!responseJson) {
+            writeJson(res, 502, openAIError("Upstream returned non-JSON response.", null, "upstream_error"));
+            return;
+          }
+          writeJson(res, 200, buildChatCompletionResponse(responseJson, model, this.now()));
           return;
         }
 
@@ -826,6 +1170,11 @@ export class ProxyRuntime {
 
     if (req.method === "POST" && url.pathname === "/v1/responses") {
       await this.handleResponses(req, res, config);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/v1/chat/completions") {
+      await this.handleChatCompletions(req, res, config);
       return;
     }
 
